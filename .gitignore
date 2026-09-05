@@ -1,0 +1,36 @@
+# Large files - do not commit to git
+*.apk
+*.xapk
+*.zip
+*.so
+*.bak
+*.jar
+
+# Tool directories
+tools/jdk/
+tools/Il2CppDumper/
+Il2CppDumper.zip
+
+# Extracted/decompiled directories (large, regeneratable)
+decompiled/
+xapk_extracted/
+il2cpp_dump/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Patch textures (generated, not needed in repo)
+patch/textures/
+
+# Build artifacts
+ludo-king-dice10.apk
+ludo-king-dice10-aligned-debugSigned.apk
+ludo-king-dice10-FINAL.apk
+
+# Keep the original game APK out too (copyright)
+Ludo King.apk
+com.ludo.king*.xapk
+
+# Keep only the patch scripts and workflow

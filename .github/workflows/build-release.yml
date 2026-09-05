@@ -1,0 +1,267 @@
+name: Build & Release Modified Ludo King APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: false
+        default: 'latest'
+
+permissions:
+  contents: write   # needed to create releases
+
+jobs:
+  build-apk:
+    name: Build Dice-1-10 APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout repo ─────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ─────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Set up Java 17 ────────────────────────────────────────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # ── 4. Install Python dependencies ───────────────────────────────────────
+      - name: Install Python packages
+        run: pip install capstone unitypy pillow
+
+      # ── 5. Download apktool and uber-apk-signer ──────────────────────────────
+      - name: Download apktool
+        run: |
+          mkdir -p tools/apktool
+          curl -sL "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar" \
+            -o tools/apktool/apktool.jar
+          curl -sL "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar" \
+            -o tools/apktool/uber-apk-signer.jar
+          echo "Tools downloaded:"
+          ls -lh tools/apktool/
+
+      # ── 6. Download the original Ludo King XAPK ──────────────────────────────
+      # NOTE: You need to provide the XAPK. Two options:
+      # Option A: Upload it as a GitHub Release asset and download here
+      # Option B: Store it in a private repo / secret URL
+      # The workflow assumes the XAPK is uploaded as a secret URL (XAPK_DOWNLOAD_URL)
+      - name: Download Ludo King XAPK
+        env:
+          XAPK_DOWNLOAD_URL: ${{ secrets.XAPK_DOWNLOAD_URL }}
+        run: |
+          if [ -z "$XAPK_DOWNLOAD_URL" ]; then
+            echo "ERROR: XAPK_DOWNLOAD_URL secret not set."
+            echo "Please add the XAPK download URL as a repository secret."
+            echo "Go to: Settings > Secrets > Actions > New repository secret"
+            echo "Name: XAPK_DOWNLOAD_URL"
+            echo "Value: (direct download link to the XAPK)"
+            exit 1
+          fi
+          echo "Downloading XAPK..."
+          curl -L "$XAPK_DOWNLOAD_URL" -o "com.ludo.king.xapk"
+          ls -lh com.ludo.king.xapk
+
+      # ── 7. Extract XAPK ──────────────────────────────────────────────────────
+      - name: Extract XAPK
+        run: |
+          mkdir -p xapk_extracted
+          unzip -o com.ludo.king.xapk -d xapk_extracted/
+          echo "XAPK contents:"
+          ls -lh xapk_extracted/
+
+          # Extract ARM64 config APK
+          mkdir -p xapk_extracted/arm64_extracted
+          unzip -o xapk_extracted/config.arm64_v8a.apk -d xapk_extracted/arm64_extracted/
+
+          echo "ARM64 libs:"
+          ls -lh xapk_extracted/arm64_extracted/lib/arm64-v8a/ || true
+
+      # ── 8. Download Il2CppDumper ──────────────────────────────────────────────
+      - name: Download Il2CppDumper
+        run: |
+          mkdir -p tools/Il2CppDumper
+          curl -sL "https://github.com/Perfare/Il2CppDumper/releases/download/v6.7.46/Il2CppDumper-net6-v6.7.46.zip" \
+            -o /tmp/il2cppdumper.zip
+          unzip -o /tmp/il2cppdumper.zip -d tools/Il2CppDumper/
+          chmod +x tools/Il2CppDumper/Il2CppDumper || true
+          ls tools/Il2CppDumper/
+
+      # ── 9. Extract base APK for global-metadata.dat ──────────────────────────
+      - name: Extract base APK
+        run: |
+          mkdir -p base_extracted
+          unzip -o xapk_extracted/com.ludo.king.apk -d base_extracted/
+          echo "global-metadata.dat:"
+          ls -lh base_extracted/assets/bin/Data/Managed/Metadata/ || true
+
+      # ── 10. Apply libil2cpp.so patch ─────────────────────────────────────────
+      - name: Patch libil2cpp.so (dice 1-6 -> 1-10)
+        run: |
+          # Set correct paths for Linux
+          cat > /tmp/patch_runner.py << 'EOF'
+          import sys
+          sys.path.insert(0, 'patch')
+          import os, struct
+
+          try:
+              from capstone import *
+              from capstone.arm64 import *
+          except ImportError:
+              os.system("pip install capstone -q")
+              from capstone import *
+              from capstone.arm64 import *
+
+          SO_SRC = "xapk_extracted/arm64_extracted/lib/arm64-v8a/libil2cpp.so"
+          SO_OUT = "xapk_extracted/arm64_extracted/lib/arm64-v8a/libil2cpp_patched.so"
+
+          BL_RVA  = 0x22927A8
+          BL_FILE = 0x228E7A8
+
+          def rva_to_file(rva):
+              return BL_FILE + (rva - BL_RVA)
+
+          def movz_w(reg, imm, shift=0):
+              hw = shift // 16
+              v = (0b0 << 31) | (0b10 << 29) | (0b100101 << 23) | (hw << 21) | (imm << 5) | reg
+              return struct.pack('<I', v)
+
+          with open(SO_SRC, 'rb') as f:
+              data = bytearray(f.read())
+
+          print(f"SO size: {len(data)/1024/1024:.1f} MB")
+          
+          md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+
+          # Patch 1: ldr w1, [x19, #0x18] -> movz w1, #10
+          foff1 = rva_to_file(0x2292774)
+          b4_1 = bytes(data[foff1:foff1+4])
+          insns1 = list(md.disasm(b4_1, 0x2292774))
+          if insns1 and insns1[0].mnemonic == 'ldr':
+              data[foff1:foff1+4] = movz_w(1, 10)
+              print(f"[OK] Patch 1: {insns1[0].mnemonic} {insns1[0].op_str} -> movz w1, #10")
+          else:
+              print(f"[WARN] Patch 1 skipped (unexpected: {[i.mnemonic for i in insns1]})")
+
+          # Patch 2: add w1, w8, #1 -> movz w1, #11  
+          foff2 = rva_to_file(0x22927A4)
+          b4_2 = bytes(data[foff2:foff2+4])
+          insns2 = list(md.disasm(b4_2, 0x22927A4))
+          if insns2 and insns2[0].mnemonic == 'add':
+              data[foff2:foff2+4] = movz_w(1, 11)
+              print(f"[OK] Patch 2: {insns2[0].mnemonic} {insns2[0].op_str} -> movz w1, #11")
+          else:
+              print(f"[WARN] Patch 2 skipped (unexpected: {[i.mnemonic for i in insns2]})")
+
+          with open(SO_OUT, 'wb') as f:
+              f.write(data)
+          print(f"[DONE] Written: {SO_OUT}")
+          EOF
+          python /tmp/patch_runner.py
+
+      # ── 11. Merge all APKs into single APK ───────────────────────────────────
+      - name: Merge APKs into single APK
+        run: |
+          python patch/build_merged_apk.py || python3 - << 'EOF'
+          import zipfile, os
+
+          BASE_APK       = "xapk_extracted/com.ludo.king.apk"
+          CONFIG_APK     = "xapk_extracted/config.arm64_v8a.apk"
+          UNITY_DATA_APK = "xapk_extracted/UnityDataAssetPack.apk"
+          ADDR_APK       = "xapk_extracted/AddressablesAssetPack.apk"
+          PATCHED_SO     = "xapk_extracted/arm64_extracted/lib/arm64-v8a/libil2cpp_patched.so"
+          OUT_APK        = "ludo-king-dice10.apk"
+
+          overrides = {"lib/arm64-v8a/libil2cpp.so": PATCHED_SO}
+          SKIP = {"META-INF/"}
+
+          with zipfile.ZipFile(OUT_APK, 'w', compression=zipfile.ZIP_DEFLATED) as out:
+              existing = set()
+              for src_path, label in [
+                  (BASE_APK, "base"), (CONFIG_APK, "config"),
+                  (UNITY_DATA_APK, "unity"), (ADDR_APK, "addr")
+              ]:
+                  if not os.path.exists(src_path):
+                      continue
+                  with zipfile.ZipFile(src_path) as src:
+                      for e in src.infolist():
+                          n = e.filename
+                          if any(n.startswith(p) for p in SKIP):
+                              continue
+                          if n in overrides:
+                              data = open(overrides[n], 'rb').read()
+                              out.writestr(zipfile.ZipInfo(n), data)
+                              existing.add(n)
+                              print(f"  [PATCH] {n}")
+                              continue
+                          if n in existing:
+                              continue
+                          out.writestr(zipfile.ZipInfo(n), src.read(n))
+                          existing.add(n)
+
+          size = os.path.getsize(OUT_APK) / 1024 / 1024
+          print(f"Merged APK: {OUT_APK} ({size:.1f} MB)")
+          EOF
+          ls -lh ludo-king-dice10.apk
+
+      # ── 12. Sign APK ─────────────────────────────────────────────────────────
+      - name: Sign APK
+        run: |
+          java -jar tools/apktool/uber-apk-signer.jar \
+            --apks ludo-king-dice10.apk \
+            --out . \
+            --allowResign
+          ls -lh ludo-king-dice10-aligned-debugSigned.apk || ls -lh *.apk
+
+      # ── 13. Rename for release ────────────────────────────────────────────────
+      - name: Rename signed APK
+        run: |
+          mv ludo-king-dice10-aligned-debugSigned.apk ludo-king-dice10-FINAL.apk
+          echo "APK_PATH=ludo-king-dice10-FINAL.apk" >> $GITHUB_ENV
+          echo "APK_SIZE=$(du -sh ludo-king-dice10-FINAL.apk | cut -f1)" >> $GITHUB_ENV
+          ls -lh ludo-king-dice10-FINAL.apk
+
+      # ── 14. Create GitHub Release ─────────────────────────────────────────────
+      - name: Get commit info
+        id: commit
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: Create Release and Upload APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag || format('v{0}-{1}', steps.commit.outputs.date, steps.commit.outputs.sha_short) }}
+          name: "Ludo King Dice 1-10 (${{ steps.commit.outputs.date }})"
+          body: |
+            ## Ludo King Modified — Dice 1–10
+
+            **Changes:** Dice now rolls 1–10 instead of 1–6!
+
+            ### Installation
+            1. Download `ludo-king-dice10-FINAL.apk`
+            2. Enable "Install unknown apps" on your Android device
+            3. Install and play!
+
+            > **Note:** Uninstall the original Ludo King first if installed.
+
+            ### Technical
+            - Patched `libil2cpp.so` at RVA `0x2292774` and `0x22927A4`
+            - Single merged APK (base + ARM64 libs + Unity assets)
+            - Signed with debug keystore
+            - APK size: ${{ env.APK_SIZE }}
+          files: ${{ env.APK_PATH }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
