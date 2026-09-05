@@ -105,6 +105,20 @@ jobs:
           echo "global-metadata.dat:"
           ls -lh base_extracted/assets/bin/Data/Managed/Metadata/ || true
 
+      # ── 9.5 Patch AndroidManifest to remove split requirements ────────────────
+      - name: Patch AndroidManifest.xml
+        run: |
+          echo "Decompiling base APK resources..."
+          # Use -s to skip decompiling dex (smali) for speed, we only need the manifest
+          java -jar tools/apktool/apktool.jar d xapk_extracted/com.ludo.king.apk -s -f -o base_apk_dec
+          
+          echo "Patching manifest flags..."
+          sed -i 's/android:isSplitRequired="true"/android:isSplitRequired="false"/g' base_apk_dec/AndroidManifest.xml
+          sed -i 's/<meta-data android:name="com.android.vending.splits.required" android:value="true"\/>/<meta-data android:name="com.android.vending.splits.required" android:value="false"\/>/g' base_apk_dec/AndroidManifest.xml
+          
+          echo "Rebuilding base APK..."
+          java -jar tools/apktool/apktool.jar b base_apk_dec -o xapk_extracted/com.ludo.king.apk
+
       # ── 10. Apply libil2cpp.so patch ─────────────────────────────────────────
       - name: Patch libil2cpp.so (dice 1-6 -> 1-10)
         run: |
