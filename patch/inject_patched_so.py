@@ -1,8 +1,16 @@
 import zipfile, os
 
-MERGED   = r"E:\Dev\ludo-king-modified\ludo-king-merged-raw.apk"
-PATCHED  = r"E:\Dev\ludo-king-modified\xapk_extracted\arm64_extracted\lib\arm64-v8a\libil2cpp_patched.so"
-OUT      = r"E:\Dev\ludo-king-modified\ludo-king-dice10.apk"
+# Works both locally and in GitHub Actions CI
+if os.path.exists("ludo-king-merged-raw.apk"):
+    # CI environment (GitHub Actions)
+    MERGED  = "ludo-king-merged-raw.apk"
+    PATCHED = "extracted_libs/lib/arm64-v8a/libil2cpp.so"
+    OUT     = "ludo-king-dice10.apk"
+else:
+    # Local environment
+    MERGED   = r"E:\Dev\ludo-king-modified\ludo-king-merged-raw.apk"
+    PATCHED  = r"E:\Dev\ludo-king-modified\xapk_extracted\arm64_extracted\lib\arm64-v8a\libil2cpp_patched.so"
+    OUT      = r"E:\Dev\ludo-king-modified\ludo-king-dice10.apk"
 TARGET_ENTRY = "lib/arm64-v8a/libil2cpp.so"
 
 print(f"Injecting patched libil2cpp.so into merged APK...")

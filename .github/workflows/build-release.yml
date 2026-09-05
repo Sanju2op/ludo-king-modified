@@ -2,7 +2,7 @@ name: Build & Release Modified Ludo King APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -44,16 +44,14 @@ jobs:
       - name: Download tools
         run: |
           mkdir -p tools
-          # APKEditor - proper split APK merger
           curl -sL "https://github.com/REAndroid/APKEditor/releases/download/V1.4.1/APKEditor-1.4.1.jar" \
             -o tools/APKEditor.jar
-          # uber-apk-signer
           curl -sL "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar" \
             -o tools/uber-apk-signer.jar
           ls -lh tools/
 
       # ── 6. Download the original Ludo King XAPK ──────────────────────────────
-      # Set XAPK_DOWNLOAD_URL in: Settings > Secrets > Actions
+      # Add XAPK_DOWNLOAD_URL in: Settings > Secrets and variables > Actions
       - name: Download Ludo King XAPK
         env:
           XAPK_DOWNLOAD_URL: ${{ secrets.XAPK_DOWNLOAD_URL }}
@@ -62,7 +60,7 @@ jobs:
             echo "ERROR: XAPK_DOWNLOAD_URL secret is not set!"
             echo "Go to: Settings > Secrets and variables > Actions > New repository secret"
             echo "  Name:  XAPK_DOWNLOAD_URL"
-            echo "  Value: (direct download URL to com.ludo.king_10.5.0.405.xapk)"
+            echo "  Value: (direct download link to the XAPK file)"
             exit 1
           fi
           echo "Downloading XAPK..."
@@ -77,9 +75,9 @@ jobs:
           echo "Split APKs:"
           ls -lh split_apks/
 
-      # ── 8. Merge split APKs with APKEditor ────────────────────────────────────
-      # APKEditor properly merges resources.arsc, removes all split metadata,
-      # and produces a true standalone APK that any Android device will accept.
+      # ── 8. Merge split APKs with APKEditor ───────────────────────────────────
+      # APKEditor properly merges resources.arsc and removes all split metadata
+      # producing a true standalone APK that installs on any Android device.
       - name: Merge split APKs
         run: |
           java -jar tools/APKEditor.jar m \
@@ -87,116 +85,18 @@ jobs:
             -o ludo-king-merged-raw.apk
           ls -lh ludo-king-merged-raw.apk
 
-      # ── 9. Patch libil2cpp.so (dice 1-6 → 1-10) ──────────────────────────────
-      - name: Extract and patch libil2cpp.so
+      # ── 9. Extract and patch libil2cpp.so (dice 1-6 to 1-10) ─────────────────
+      - name: Patch libil2cpp.so
         run: |
-          # Extract libil2cpp.so from merged APK
           mkdir -p extracted_libs
           unzip -o ludo-king-merged-raw.apk "lib/arm64-v8a/libil2cpp.so" -d extracted_libs/
           ls -lh extracted_libs/lib/arm64-v8a/libil2cpp.so
-
-          # Apply patch
-          cat > /tmp/patch_dice.py << 'PYEOF'
-import struct, os
-
-try:
-    from capstone import *
-    from capstone.arm64 import *
-except ImportError:
-    os.system("pip install capstone -q")
-    from capstone import *
-    from capstone.arm64 import *
-
-SO = "extracted_libs/lib/arm64-v8a/libil2cpp.so"
-
-def parse_segs(data):
-    e_phoff = struct.unpack_from('<Q', data, 0x20)[0]
-    e_phentsize = struct.unpack_from('<H', data, 0x36)[0]
-    e_phnum = struct.unpack_from('<H', data, 0x38)[0]
-    segs = []
-    for i in range(e_phnum):
-        off = e_phoff + i * e_phentsize
-        if struct.unpack_from('<I', data, off)[0] == 1:
-            segs.append((struct.unpack_from('<Q', data, off+0x10)[0],
-                         struct.unpack_from('<Q', data, off+0x08)[0],
-                         struct.unpack_from('<Q', data, off+0x20)[0]))
-    return segs
-
-def rva2off(segs, rva):
-    for v, fo, fsz in segs:
-        if v <= rva < v + fsz:
-            return fo + (rva - v)
-    return None
-
-def movz_w(reg, imm):
-    v = (0b0 << 31) | (0b10 << 29) | (0b100101 << 23) | (0 << 21) | (imm << 5) | reg
-    return struct.pack('<I', v)
-
-with open(SO, 'rb') as f:
-    data = bytearray(f.read())
-
-segs = parse_segs(data)
-md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
-BL_RVA = 0x22927A8
-BL_FILE = rva2off(segs, BL_RVA)
-
-# Patch 1: ldr w1, [x19, #0x18] -> movz w1, #10  (RVA 0x2292774)
-foff1 = BL_FILE + (0x2292774 - BL_RVA)
-b4 = bytes(data[foff1:foff1+4])
-insns = list(md.disasm(b4, 0x2292774))
-if insns and insns[0].mnemonic == 'ldr':
-    data[foff1:foff1+4] = movz_w(1, 10)
-    print(f"[OK] Patch 1: {insns[0].mnemonic} -> movz w1, #10")
-else:
-    print(f"[WARN] Patch 1 unexpected: {[i.mnemonic for i in insns]}")
-
-# Patch 2: add w1, w8, #1 -> movz w1, #11  (RVA 0x22927A4)
-foff2 = BL_FILE + (0x22927A4 - BL_RVA)
-b4 = bytes(data[foff2:foff2+4])
-insns = list(md.disasm(b4, 0x22927A4))
-if insns and insns[0].mnemonic == 'add':
-    data[foff2:foff2+4] = movz_w(1, 11)
-    print(f"[OK] Patch 2: {insns[0].mnemonic} -> movz w1, #11")
-else:
-    print(f"[WARN] Patch 2 unexpected: {[i.mnemonic for i in insns]}")
-
-with open(SO, 'wb') as f:
-    f.write(data)
-print(f"[DONE] Patched SO written: {SO}")
-PYEOF
-          python /tmp/patch_dice.py
+          python patch/patch_dice_ci.py
 
       # ── 10. Inject patched libil2cpp.so back into APK ────────────────────────
       - name: Inject patched libil2cpp.so
         run: |
-          cat > /tmp/inject.py << 'PYEOF'
-import zipfile, os, shutil
-
-MERGED  = "ludo-king-merged-raw.apk"
-PATCHED = "extracted_libs/lib/arm64-v8a/libil2cpp.so"
-OUT     = "ludo-king-dice10.apk"
-TARGET  = "lib/arm64-v8a/libil2cpp.so"
-
-patched_data = open(PATCHED, 'rb').read()
-print(f"Injecting patched SO ({len(patched_data)/1024/1024:.1f} MB)...")
-
-if os.path.exists(OUT):
-    os.remove(OUT)
-
-with zipfile.ZipFile(MERGED, 'r') as src, zipfile.ZipFile(OUT, 'w', allowZip64=True) as dst:
-    for item in src.infolist():
-        if item.filename == TARGET:
-            info = zipfile.ZipInfo(item.filename)
-            info.compress_type = zipfile.ZIP_STORED  # .so must be uncompressed
-            dst.writestr(info, patched_data)
-            print(f"  Replaced: {item.filename}")
-        else:
-            dst.writestr(item, src.read(item.filename))
-
-size = os.path.getsize(OUT)/1024/1024
-print(f"Done! {OUT} ({size:.1f} MB)")
-PYEOF
-          python /tmp/inject.py
+          python patch/inject_patched_so.py
           ls -lh ludo-king-dice10.apk
 
       # ── 11. Sign APK ──────────────────────────────────────────────────────────
@@ -206,34 +106,34 @@ PYEOF
             --apks ludo-king-dice10.apk \
             --out . \
             --allowResign
-          # Rename to clean final name
           mv ludo-king-dice10-aligned-debugSigned.apk ludo-king-modified.apk
           echo "APK_SIZE=$(du -sh ludo-king-modified.apk | cut -f1)" >> $GITHUB_ENV
           ls -lh ludo-king-modified.apk
 
-      # ── 12. Create GitHub Release ─────────────────────────────────────────────
+      # ── 12. Get commit info ───────────────────────────────────────────────────
       - name: Get commit info
         id: commit
         run: |
           echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
 
+      # ── 13. Create GitHub Release ─────────────────────────────────────────────
       - name: Create Release and Upload APK
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag || format('v{0}-{1}', steps.commit.outputs.date, steps.commit.outputs.sha_short) }}
           name: "Ludo King Dice 1-10 (${{ steps.commit.outputs.date }})"
           body: |
-            ## Ludo King Modified — Dice 1–10
+            ## Ludo King Modified - Dice 1-10
 
-            **Changes:** Dice now rolls 1–10 instead of 1–6!
+            **Changes:** Dice now rolls 1-10 instead of 1-6!
 
             ### Installation
             1. Download `ludo-king-modified.apk`
-            2. Enable **"Install unknown apps"** on your Android device
+            2. Enable "Install unknown apps" on your Android device
             3. Install and play!
 
-            > Uninstall the original Ludo King first if already installed.
+            Uninstall the original Ludo King first if already installed.
 
             **APK size:** ${{ env.APK_SIZE }}
             **Merged using:** APKEditor (proper standalone APK, no split issues)
